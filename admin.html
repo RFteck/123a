@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<!-- REGRAS DO FIRESTORE (cole em Firebase Console > Firestore > Regras > Publicar):
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAdmin() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // Quem é admin: o usuário só consegue ler o próprio documento; ninguém escreve pelo app.
+    match /admins/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+      allow list, write: if false;
+    }
+
+    // Conteúdo público do site: todos leem, só admin altera.
+    match /settings/{id}  { allow read: if true; allow write: if isAdmin(); }
+    match /services/{id}  { allow read: if true; allow write: if isAdmin(); }
+    match /gallery/{id}   { allow read: if true; allow write: if isAdmin(); }
+
+    // Avaliações: público lê só as aprovadas e envia novas como "pending".
+    match /reviews/{id} {
+      allow read: if resource.data.status == 'approved' || isAdmin();
+      allow create: if (
+          request.resource.data.keys().hasOnly(['name','place','rating','text','status','date'])
+          && request.resource.data.status == 'pending'
+          && request.resource.data.rating is number
+          && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+          && request.resource.data.name is string && request.resource.data.name.size() <= 120
+          && request.resource.data.text is string && request.resource.data.text.size() <= 2000
+        ) || isAdmin();
+      allow update, delete: if isAdmin();
+    }
+
+    // Pedidos de orçamento: público só cria; admin gerencia.
+    match /requests/{id} {
+      allow create: if (
+          request.resource.data.keys().hasOnly(['createdAt','name','phone','email','address','property','service','urgency','message','status'])
+          && request.resource.data.status == 'Novo'
+          && request.resource.data.name is string && request.resource.data.name.size() <= 200
+          && request.resource.data.message is string && request.resource.data.message.size() <= 3000
+        ) || isAdmin();
+      allow read, update, delete: if isAdmin();
+    }
+
+    // Agendamentos: público só cria; admin gerencia.
+    match /appointments/{id} {
+      allow create: if (
+          request.resource.data.keys().hasOnly(['createdAt','name','phone','address','kind','date','time','notes','status'])
+          && request.resource.data.status == 'Pendente'
+          && request.resource.data.name is string && request.resource.data.name.size() <= 200
+        ) || isAdmin();
+      allow read, update, delete: if isAdmin();
+    }
+
+    // Horários ocupados: público lê (para esconder horários) e só cria se o ID for "data_hora".
+    // Como não pode atualizar, dois clientes não conseguem reservar o mesmo horário.
+    match /slots/{slotId} {
+      allow read: if true;
+      allow create: if (
+          request.resource.data.keys().hasOnly(['date','time'])
+          && slotId == request.resource.data.date + '_' + request.resource.data.time
+        ) || isAdmin();
+      allow update, delete: if isAdmin();
+    }
+
+    match /clients/{id} { allow read, write: if isAdmin(); }
+  }
+}
+-->
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Painel administrativo — VSR</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--blue-50:#f3f9ff;--blue-100:#e0f1ff;--blue-200:#bfe2ff;--blue-400:#6fbcf5;--purple-100:#ece6ff;--purple-400:#9a82ff;--purple-500:#7c5cff;--purple-600:#6a45f0;--purple-800:#2b1d63;--purple-900:#1b1245;--ink:#1b1840;--muted:#625f86;--line:#e6e3f7;--bad:#e0485e;--shadow:0 10px 32px rgba(76,52,170,.10)}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',system-ui,sans-serif;color:var(--ink);background:linear-gradient(180deg,var(--blue-100),#f6f3ff 400px,#f8f9ff);min-height:100vh;-webkit-font-smoothing:antialiased}
+h1,h2,h3{font-family:'Fraunces',Georgia,serif;font-weight:600}
+button{font:inherit;cursor:pointer}
+svg.ic{width:1em;height:1em;flex:none}
+.hidden{display:none!important}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:99px;padding:11px 22px;font-weight:600;font-size:.88rem;color:#fff;background:linear-gradient(135deg,var(--purple-600),var(--purple-500));box-shadow:0 8px 20px rgba(106,69,240,.25);transition:.2s;white-space:nowrap;text-decoration:none}
+.btn:hover{transform:translateY(-1px)}
+.btn:disabled{opacity:.6;cursor:wait}
+.btn.ghost{background:#fff;color:var(--purple-800);border:1.5px solid var(--line);box-shadow:none}
+.btn.danger{background:#fff;color:var(--bad);border:1.5px solid #f6ccd3;box-shadow:none}
+.btn.wa{background:#25d366;box-shadow:none}
+.btn.xs{padding:7px 14px;font-size:.78rem}
+
+#login{min-height:100vh;display:grid;place-items:center;padding:20px}
+.login-box{background:#fff;border-radius:32px;padding:42px 34px;width:min(420px,100%);box-shadow:var(--shadow);text-align:center}
+.mark{width:56px;height:56px;border-radius:18px;background:linear-gradient(135deg,var(--purple-600),var(--blue-400));display:grid;place-items:center;color:#fff;font-size:1.7rem;margin:0 auto 18px}
+.login-box h1{font-size:1.8rem;margin-bottom:6px}
+.login-box p{color:var(--muted);font-size:.9rem;margin-bottom:24px}
+.field{display:flex;flex-direction:column;gap:6px;margin-bottom:14px;text-align:left}
+.field label{font-size:.8rem;font-weight:600;color:var(--purple-800)}
+.field input,.field select,.field textarea{font:inherit;font-size:.92rem;padding:12px 15px;border:1.5px solid var(--line);border-radius:14px;background:#fff;color:var(--ink);outline:none;width:100%;transition:.2s}
+.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--purple-500);box-shadow:0 0 0 4px rgba(124,92,255,.12)}
+.field textarea{resize:vertical;min-height:84px}
+.err{color:var(--bad);font-size:.82rem;min-height:20px;margin-bottom:8px}
+.linkbtn{background:none;border:0;color:var(--purple-600);font-size:.84rem;font-weight:600;margin-top:16px}
+
+#app{display:none;min-height:100vh}
+.side{position:fixed;inset:0 auto 0 0;width:262px;background:linear-gradient(170deg,var(--purple-900),var(--purple-800));color:#d9d4f5;padding:24px 16px;display:flex;flex-direction:column;z-index:40;transition:.3s;border-radius:0 34px 34px 0}
+.brand{display:flex;align-items:center;gap:12px;color:#fff;font-family:'Fraunces',serif;font-weight:700;font-size:1.3rem;padding:0 10px 22px}
+.brand .mark{width:40px;height:40px;border-radius:13px;margin:0;font-size:1.2rem}
+.brand small{display:block;font-family:'Inter';font-weight:500;font-size:.7rem;opacity:.7}
+.side nav{display:flex;flex-direction:column;gap:4px;flex:1;overflow:auto}
+.side nav button{display:flex;align-items:center;gap:13px;background:none;border:0;color:#cfc8f2;padding:12px 14px;border-radius:16px;font-size:.9rem;font-weight:500;text-align:left;transition:.2s}
+.side nav button .ic{font-size:1.15rem}
+.side nav button:hover{background:rgba(255,255,255,.08);color:#fff}
+.side nav button.on{background:linear-gradient(135deg,var(--purple-500),var(--purple-600));color:#fff;box-shadow:0 8px 20px rgba(0,0,0,.25)}
+.side nav .badge{margin-left:auto;background:#fff;color:var(--purple-600);font-size:.7rem;font-weight:700;padding:2px 8px;border-radius:99px}
+.side .bottom{display:grid;gap:8px;padding-top:14px;border-top:1px solid rgba(255,255,255,.12)}
+.side .bottom a,.side .bottom button{display:flex;align-items:center;gap:12px;color:#cfc8f2;background:none;border:0;padding:10px 14px;border-radius:14px;font-size:.86rem;text-decoration:none}
+.side .bottom a:hover,.side .bottom button:hover{background:rgba(255,255,255,.08);color:#fff}
+.content{margin-left:262px;padding:28px 34px 60px}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:26px;flex-wrap:wrap}
+.topbar h2{font-size:2rem}
+.topbar p{color:var(--muted);font-size:.9rem}
+.menu-btn{display:none;background:#fff;border:1.5px solid var(--line);width:44px;height:44px;border-radius:14px;font-size:1.3rem;color:var(--purple-800)}
+.scrim{display:none;position:fixed;inset:0;background:rgba(27,18,69,.5);z-index:35}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:16px;margin-bottom:24px}
+.stat{background:#fff;border-radius:24px;padding:20px;box-shadow:var(--shadow);display:flex;gap:14px;align-items:center;border:1px solid var(--line);cursor:pointer;transition:.2s}
+.stat:hover{transform:translateY(-3px)}
+.stat .ico{width:50px;height:50px;border-radius:16px;display:grid;place-items:center;font-size:1.4rem;background:var(--purple-100);color:var(--purple-600)}
+.stat:nth-child(2n) .ico{background:var(--blue-100);color:#2d86d0}
+.stat b{font-family:'Fraunces',serif;font-size:1.9rem;line-height:1;display:block}
+.stat span{font-size:.8rem;color:var(--muted)}
+.box{background:#fff;border-radius:26px;box-shadow:var(--shadow);border:1px solid var(--line);padding:22px;margin-bottom:22px}
+.box h3{font-size:1.25rem;margin-bottom:14px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+.toolbar{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
+.toolbar input{font:inherit;font-size:.88rem;padding:10px 16px;border:1.5px solid var(--line);border-radius:99px;outline:none;background:#fff;min-width:220px}
+.toolbar input:focus{border-color:var(--purple-500)}
+.tbl-wrap{overflow-x:auto;margin:0 -6px}
+table{width:100%;border-collapse:collapse;font-size:.86rem;min-width:640px}
+th{text-align:left;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);padding:10px 12px;border-bottom:1.5px solid var(--line)}
+td{padding:14px 12px;border-bottom:1px solid #f0eefb;vertical-align:top}
+tr:last-child td{border-bottom:0}
+td small{color:var(--muted);display:block;font-size:.78rem}
+td .msg{max-width:280px;color:var(--muted);font-size:.82rem}
+.acts{display:flex;gap:6px;flex-wrap:wrap}
+.st{font:inherit;font-size:.78rem;font-weight:600;border:0;border-radius:99px;padding:7px 12px;outline:none;cursor:pointer;text-align:center}
+.st.Novo,.st.Pendente,.st.pending{background:#fff1d6;color:#a86b00}
+.st[data-v="Em análise"]{background:var(--blue-100);color:#1f6fb3}
+.st.Orçado,.st.Confirmado{background:var(--purple-100);color:var(--purple-600)}
+.st.Fechado,.st.Concluído,.st.approved{background:#dcf5ea;color:#13805b}
+.st.Cancelado,.st.hidden{background:#fde3e7;color:#b8283e}
+.list{display:grid;gap:12px}
+.item{display:flex;align-items:center;gap:14px;padding:14px 16px;border-radius:18px;background:var(--blue-50);border:1px solid var(--blue-100)}
+.item .date{background:#fff;border-radius:14px;padding:8px 12px;text-align:center;min-width:62px;box-shadow:0 4px 12px rgba(76,52,170,.08)}
+.item .date b{display:block;font-family:'Fraunces',serif;font-size:1.2rem;color:var(--purple-600);line-height:1.1}
+.item .date span{font-size:.7rem;color:var(--muted)}
+.item div.info{flex:1;min-width:0}
+.item div.info b{display:block;font-size:.92rem}
+.item div.info span{font-size:.8rem;color:var(--muted)}
+.empty{padding:30px;text-align:center;color:var(--muted);font-size:.9rem}
+.stars{color:#f5a623;letter-spacing:1px}
+.photos{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:18px}
+.photo{background:#fff;border-radius:22px;overflow:hidden;box-shadow:var(--shadow);border:1px solid var(--line)}
+.photo img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:var(--blue-100)}
+.photo .pb{padding:14px 16px}
+.photo .pb b{display:block;font-size:.92rem}
+.photo .pb span.c{font-size:.76rem;color:var(--purple-600);background:var(--purple-100);padding:2px 10px;border-radius:99px;display:inline-block;margin:6px 0 10px}
+.cards-s{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.sv{background:#fff;border:1px solid var(--line);border-radius:22px;padding:20px;box-shadow:var(--shadow)}
+.sv .top{display:flex;gap:14px;align-items:center;margin-bottom:10px}
+.sv .ico{width:46px;height:46px;border-radius:14px;background:var(--purple-100);color:var(--purple-600);display:grid;place-items:center;font-size:1.3rem}
+.sv p{font-size:.84rem;color:var(--muted);margin-bottom:12px}
+.sv.off{opacity:.55}
+.tag{font-size:.72rem;font-weight:600;padding:3px 10px;border-radius:99px;background:var(--purple-100);color:var(--purple-600)}
+.tag.off{background:#eee;color:#777}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+
+#modal{position:fixed;inset:0;background:rgba(27,18,69,.55);display:none;place-items:center;padding:16px;z-index:100;overflow:auto}
+#modal.open{display:grid}
+.mbox{background:#fff;border-radius:28px;padding:26px;width:min(560px,100%);max-height:94vh;overflow:auto;box-shadow:0 30px 80px rgba(0,0,0,.35)}
+.mh{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+.mh h3{font-size:1.4rem}
+.mh button{background:var(--blue-50);border:0;width:38px;height:38px;border-radius:50%;font-size:1rem}
+.mf{display:flex;justify-content:flex-end;gap:10px;margin-top:8px}
+.preview{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:16px;margin-bottom:12px;background:var(--blue-100)}
+.toast{position:fixed;left:50%;bottom:28px;transform:translate(-50%,40px);background:var(--purple-900);color:#fff;padding:13px 24px;border-radius:99px;font-size:.88rem;opacity:0;pointer-events:none;transition:.3s;z-index:300;max-width:90vw;text-align:center}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+
+@media(max-width:980px){
+  .side{transform:translateX(-105%)}
+  .side.open{transform:none}
+  .scrim.open{display:block}
+  .content{margin-left:0;padding:20px 16px 60px}
+  .menu-btn{display:grid;place-items:center}
+  .two{grid-template-columns:1fr}
+  .topbar h2{font-size:1.6rem}
+}
+@media(max-width:560px){.grid2{grid-template-columns:1fr}.toolbar input{min-width:0;flex:1}}
+</style>
+</head>
+<body>
+
+<div id="login">
+  <form class="login-box" id="loginForm">
+    <div class="mark" id="loginMark"></div>
+    <h1>Painel administrativo</h1>
+    <p>Entre para gerenciar clientes, serviços, fotos, avaliações e agendamentos.</p>
+    <div class="field"><label>E-mail</label><input type="email" id="email" autocomplete="username" required autofocus></div>
+    <div class="field"><label>Senha</label><input type="password" id="pass" autocomplete="current-password" required></div>
+    <div class="err" id="loginErr"></div>
+    <button class="btn" id="loginBtn" style="width:100%">Entrar</button>
+    <button class="linkbtn" type="button" id="forgot">Esqueci minha senha</button>
+  </form>
+</div>
+
+<div id="app">
+  <aside class="side" id="side">
+    <div class="brand"><span class="mark" id="brandMark"></span><div><span id="brandName">VSR</span><small>Painel admin</small></div></div>
+    <nav id="nav"></nav>
+    <div class="bottom">
+      <a href="index.html" target="_blank" id="siteLink"></a>
+      <button id="logout"></button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+  <main class="content">
+    <div class="topbar">
+      <div style="display:flex;gap:14px;align-items:center"><button class="menu-btn" id="menuBtn" aria-label="Menu">☰</button><div><h2 id="title"></h2><p id="subtitle"></p></div></div>
+      <div id="topActions"></div>
+    </div>
+    <div id="view"></div>
+  </main>
+</div>
+
+<div id="modal"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+// Configuração do Firebase para index.html e admin.html (HTML puro, sem bundler).
+// Este arquivo precisa ficar na MESMA pasta dos dois HTMLs.
+// A apiKey do Firebase Web é pública por natureza: a segurança vem das regras do Firestore (firestore.rules).
+window.FIREBASE_CONFIG = {
+  apiKey: "AIzaSyAWLtl84Umajh8UAOnq6sNW46POZ_TCSvM",
+  authDomain: "dragoes-1c33b.firebaseapp.com",
+  projectId: "dragoes-1c33b",
+  storageBucket: "dragoes-1c33b.firebasestorage.app",
+  messagingSenderId: "4417567938",
+  appId: "1:4417567938:web:2c077e2965b5bafecbcf5b",
+  measurementId: "G-1FRDYCZ02H"
+};
+
+// false = fotos da galeria ficam salvas dentro do Firestore (não precisa do Firebase Storage).
+// Só mude para true se você ativou o Storage (exige plano Blaze) e publicou as regras dele.
+window.USE_STORAGE = false;
+</script>
+<script>
+const ICONS={
+ bolt:'<path d="M13 2 3 14h7l-1 8 10-12h-7z"/>',
+ bulb:'<path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.3h6c0-1 .4-1.8 1-2.3A7 7 0 0 0 12 2z"/>',
+ plug:'<path d="M9 2v6M15 2v6M6 8h12v4a6 6 0 0 1-12 0zM12 18v4"/>',
+ wrench:'<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/>',
+ building:'<path d="M4 22V4a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v18M15 9h4a1 1 0 0 1 1 1v12M2 22h20M8 7h3M8 11h3M8 15h3"/>',
+ home:'<path d="M3 11 12 3l9 8M5 10v11h14V10M10 21v-6h4v6"/>',
+ shield:'<path d="M12 2 4 5v6c0 5 3.4 9 8 11 4.6-2 8-6 8-11V5z"/><path d="m9 12 2 2 4-4"/>',
+ panel:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h2"/>',
+ users:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6 6 0 0 1 3.5 6"/>',
+ inbox:'<path d="M3 13h5l1 3h6l1-3h5M5 5h14l2 8v6H3v-6z"/>',
+ cal:'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+ image:'<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.8"/><path d="m21 16-5-5-9 9"/>',
+ star:'<path d="m12 2 3 6.5 7 .9-5.2 4.9 1.4 7L12 17.8 5.8 21.3l1.4-7L2 9.4l7-.9z"/>',
+ gear:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/>',
+ grid:'<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+ out:'<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
+ globe:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+ plus:'<path d="M12 5v14M5 12h14"/>'
+};
+const icon=n=>`<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[n]||ICONS.bolt}</svg>`;
+const ICON_CHOICES=['bulb','plug','wrench','home','panel','shield','building','bolt'];
+
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const digits=s=>String(s||'').replace(/\D/g,'');
+const waNum=n=>{const d=digits(n);return d.length<=11?'55'+d:d};
+const waLink=(num,msg)=>`https://wa.me/${waNum(num)}?text=${encodeURIComponent(msg)}`;
+const fmtDate=iso=>{if(!iso)return'';const [y,m,d]=iso.slice(0,10).split('-');return `${d}/${m}/${y}`};
+const fmtDT=iso=>{const d=new Date(iso);return isNaN(d)?'':d.toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'})};
+const MONTHS=['jan','fev','mar','abr','mai','jun','jul','ago','set','out','nov','dez'];
+const stars=n=>`<span class="stars">${'★'.repeat(n)}${'☆'.repeat(5-n)}</span>`;
+const todayStr=()=>{const d=new Date();return new Date(d.getTime()-d.getTimezoneOffset()*6e4).toISOString().slice(0,10)};
+const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+const byDesc=k=>(a,b)=>String(b[k]||'').localeCompare(String(a[k]||''));
+function toast(t){const e=$('#toast');e.textContent=t;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2800)}
+
+const COLLS=['services','gallery','reviews','clients','requests','appointments'];
+const db={settings:{},services:[],gallery:[],reviews:[],clients:[],requests:[],appointments:[]};
+let APP=null,fs=null,FS=null,auth=null,AU=null,storage=null,ST=null,view='dashboard',unsubs=[],loaded=new Set();
+const useStorage=()=>window.USE_STORAGE===true&&!!(window.FIREBASE_CONFIG||{}).storageBucket;
+const col=n=>FS.collection(fs,n);
+const dref=(n,id)=>FS.doc(fs,n,id);
+const slotId=a=>`${a.date}_${a.time}`;
+
+async function initFirebase(){
+  const cfg=window.FIREBASE_CONFIG||{};
+  if(!cfg.apiKey||!cfg.projectId)throw new Error('config');
+  const base='https://www.gstatic.com/firebasejs/10.14.1/';
+  const mods=[import(base+'firebase-app.js'),import(base+'firebase-firestore.js'),import(base+'firebase-auth.js')];
+  if(useStorage())mods.push(import(base+'firebase-storage.js'));
+  const [a,s,u,t]=await Promise.all(mods);
+  APP=a.initializeApp(cfg);FS=s;AU=u;fs=s.getFirestore(APP);auth=u.getAuth(APP);
+  if(t){ST=t;storage=t.getStorage(APP)}
+}
+
+$('#loginMark').innerHTML=icon('bolt');$('#brandMark').innerHTML=icon('bolt');
+$('#siteLink').innerHTML=icon('globe')+' Ver site';$('#logout').innerHTML=icon('out')+' Sair';
+
+function loginMsg(t){$('#loginErr').textContent=t||''}
+function showLogin(){$('#app').style.display='none';$('#login').style.display='grid';$('#loginBtn').disabled=false}
+function authError(e){
+  const c=e&&e.code||'';
+  if(['auth/invalid-credential','auth/wrong-password','auth/user-not-found','auth/invalid-email'].includes(c))return 'E-mail ou senha incorretos.';
+  if(c==='auth/too-many-requests')return 'Muitas tentativas. Aguarde um pouco e tente novamente.';
+  if(c==='auth/network-request-failed')return 'Sem conexão. Verifique sua internet.';
+  return 'Não foi possível entrar. Tente novamente.';
+}
+$('#loginForm').onsubmit=async e=>{
+  e.preventDefault();loginMsg('');
+  if(!auth){loginMsg('Painel indisponível no momento.');return}
+  $('#loginBtn').disabled=true;
+  try{await AU.signInWithEmailAndPassword(auth,$('#email').value.trim(),$('#pass').value)}
+  catch(err){loginMsg(authError(err));$('#loginBtn').disabled=false}
+};
+$('#forgot').onclick=async()=>{
+  const em=$('#email').value.trim();
+  if(!em){loginMsg('Informe seu e-mail acima para receber o link.');return}
+  if(!auth)return;
+  try{await AU.sendPasswordResetEmail(auth,em)}catch(e){console.error(e)}
+  loginMsg('');toast('Se o e-mail estiver cadastrado, você receberá um link para redefinir a senha.');
+};
+$('#logout').onclick=()=>{if(auth)AU.signOut(auth)};
+
+async function isAdmin(user){
+  try{const d=await FS.getDoc(dref('admins',user.uid));return d.exists()}catch(e){return false}
+}
+async function seedIfNeeded(){
+  const s=await FS.getDoc(dref('settings','main'));
+  if(s.exists())return;
+  const b=FS.writeBatch(fs);
+  b.set(dref('settings','main'),{company:'VSR',whatsapp:'',phone:'',email:'',address:'',hours:'Segunda a sábado, das 8h às 18h'});
+  [
+   ['Instalação de iluminação','Projetos e instalação de iluminação LED, spots, fitas, arandelas e iluminação externa.','bulb'],
+   ['Fiação e cabeamento','Troca e instalação de fiação, tomadas, interruptores e pontos novos com segurança.','plug'],
+   ['Manutenção elétrica','Correção de curtos, quedas de energia, disjuntores desarmando e manutenção preventiva.','wrench'],
+   ['Reformas elétricas','Atualização completa da instalação elétrica de casas, apartamentos e salas comerciais.','home'],
+   ['Quadros e disjuntores','Montagem e adequação de quadros de distribuição residenciais e prediais.','panel'],
+   ['Revisão e laudos técnicos','Inspeção completa da instalação, com relatório técnico para condomínios e empresas.','shield']
+  ].forEach((x,i)=>b.set(dref('services',`svc-${i+1}`),{title:x[0],desc:x[1],icon:x[2],price:'',active:true,order:i+1}));
+  await b.commit();
+}
+function stopData(){unsubs.forEach(u=>u());unsubs=[];loaded=new Set()}
+function startData(){
+  stopData();
+  const err=e=>{console.error(e);toast('Falha ao carregar dados. Verifique sua conexão e as regras do Firestore.')};
+  unsubs.push(FS.onSnapshot(dref('settings','main'),s=>{db.settings=s.exists()?s.data():{};onData('settings')},err));
+  COLLS.forEach(c=>unsubs.push(FS.onSnapshot(col(c),snap=>{db[c]=snap.docs.map(d=>({id:d.id,...d.data()}));onData(c)},err)));
+}
+function enterApp(){
+  $('#login').style.display='none';$('#app').style.display='block';
+  const hash=location.hash.slice(1);if(VIEWS[hash])view=hash;
+  nav(view);
+}
+async function boot(){
+  try{await initFirebase()}catch(e){loginMsg('Painel indisponível no momento.');$('#loginBtn').disabled=true;return}
+  AU.onAuthStateChanged(auth,async user=>{
+    if(!user){stopData();showLogin();return}
+    if(!(await isAdmin(user))){loginMsg('Esta conta não tem acesso ao painel.');await AU.signOut(auth);return}
+    try{await seedIfNeeded()}catch(e){console.error(e)}
+    startData();enterApp();
+  });
+}
+
+const VIEWS={
+ dashboard:{t:'Visão geral',s:'Resumo da sua operação',i:'grid'},
+ requests:{t:'Solicitações',s:'Pedidos de orçamento recebidos pelo site',i:'inbox'},
+ appointments:{t:'Agendamentos',s:'Revisões, manutenções e visitas técnicas',i:'cal'},
+ clients:{t:'Clientes',s:'Cadastro e histórico de clientes',i:'users'},
+ services:{t:'Serviços',s:'O que aparece na página do cliente',i:'wrench'},
+ gallery:{t:'Galeria de fotos',s:'Trabalhos realizados exibidos no site',i:'image'},
+ reviews:{t:'Avaliações',s:'Modere o que os clientes publicam',i:'star'},
+ settings:{t:'Configurações',s:'Dados da empresa e acesso',i:'gear'}
+};
+function badges(){return{requests:db.requests.filter(r=>r.status==='Novo').length,appointments:db.appointments.filter(a=>a.status==='Pendente').length,reviews:db.reviews.filter(r=>r.status==='pending').length}}
+function drawNav(){
+  const b=badges();
+  $('#brandName').textContent=db.settings.company||'VSR';
+  $('#nav').innerHTML=Object.entries(VIEWS).map(([k,x])=>`<button class="${k===view?'on':''}" onclick="nav('${k}')">${icon(x.i)}<span>${x.t}</span>${b[k]?`<span class="badge">${b[k]}</span>`:''}</button>`).join('');
+}
+function nav(v,keep){
+  view=v;drawNav();
+  $('#title').textContent=VIEWS[v].t;$('#subtitle').textContent=VIEWS[v].s;
+  $('#topActions').innerHTML='';
+  $('#view').innerHTML=R[v]();
+  if(!keep){closeSide();scrollTo(0,0)}
+}
+const closeSide=()=>{$('#side').classList.remove('open');$('#scrim').classList.remove('open')};
+$('#menuBtn').onclick=()=>{$('#side').classList.add('open');$('#scrim').classList.add('open')};
+$('#scrim').onclick=closeSide;
+const action=(label,fn)=>{$('#topActions').innerHTML=`<button class="btn" onclick="${fn}">${icon('plus')} ${label}</button>`};
+
+function onData(k){
+  if(k)loaded.add(k);
+  if($('#app').style.display!=='block')return;
+  syncClients();
+  clearTimeout(onData.t);
+  onData.t=setTimeout(()=>{
+    if($('#modal').classList.contains('open')){drawNav();return}
+    const a=document.activeElement;
+    if(a&&a.closest&&a.closest('#view')&&/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)){drawNav();return}
+    nav(view,true);
+  },60);
+}
+const made=new Set();
+function syncClients(){
+  if(!['clients','requests','appointments'].every(k=>loaded.has(k)))return;
+  const known=new Set(db.clients.map(c=>digits(c.phone)));
+  const todo=[];
+  [['requests',db.requests],['appointments',db.appointments]].forEach(([c,list])=>list.forEach(r=>{
+    if(r.clientSynced===true)return;
+    todo.push([c,r]);
+  }));
+  if(!todo.length)return;
+  const b=FS.writeBatch(fs);const newPhones=new Set();
+  todo.forEach(([c,r])=>{
+    const p=digits(r.phone);
+    if(p&&!known.has(p)&&!made.has(p)){made.add(p);newPhones.add(p);b.set(FS.doc(col('clients')),{name:r.name,phone:r.phone,email:r.email||'',address:r.address||'',notes:'',createdAt:todayStr()})}
+    b.update(dref(c,r.id),{clientSynced:true});
+  });
+  b.commit().catch(e=>{console.error(e);newPhones.forEach(p=>made.delete(p))});
+}
+
+function modal(title,body,onSave,label='Salvar'){
+  $('#modal').innerHTML=`<div class="mbox"><div class="mh"><h3>${title}</h3><button type="button" onclick="closeModal()">✕</button></div><form id="mform">${body}<div class="mf"><button type="button" class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn" id="msave">${label}</button></div></form></div>`;
+  $('#modal').classList.add('open');
+  $('#mform').onsubmit=async e=>{
+    e.preventDefault();$('#msave').disabled=true;
+    let r;try{r=await onSave(new FormData(e.target),e.target)}catch(x){console.error(x);toast('Não foi possível salvar. Verifique sua conexão e permissões.');r=false}
+    if(r===false){$('#msave').disabled=false;return}
+    closeModal();onData();
+  };
+}
+const closeModal=()=>$('#modal').classList.remove('open');
+$('#modal').onclick=e=>{if(e.target.id==='modal')closeModal()};
+const F=(l,n,v='',t='text',x='')=>`<div class="field"><label>${l}</label><input name="${n}" type="${t}" value="${esc(v)}" ${x}></div>`;
+const T=(l,n,v='',x='')=>`<div class="field"><label>${l}</label><textarea name="${n}" ${x}>${esc(v)}</textarea></div>`;
+const S=(l,n,opts,v='')=>`<div class="field"><label>${l}</label><select name="${n}">${opts.map(o=>{const [val,lab]=Array.isArray(o)?o:[o,o];return `<option value="${esc(val)}" ${val==v?'selected':''}>${esc(lab)}</option>`}).join('')}</select></div>`;
+function filterRows(q,id){q=q.toLowerCase();$$('#'+id+' tbody tr').forEach(tr=>tr.style.display=tr.textContent.toLowerCase().includes(q)?'':'none')}
+const statusSel=(coll,id,val,opts)=>`<select class="st ${esc(val)}" data-v="${esc(val)}" onchange="this.blur();setStatus('${coll}','${id}',this.value)">${opts.map(o=>{const [v,l]=Array.isArray(o)?o:[o,o];return `<option value="${v}" ${v===val?'selected':''}>${l}</option>`}).join('')}</select>`;
+async function run(fn,ok){try{await fn();if(ok)toast(ok);return true}catch(e){console.error(e);toast('Não foi possível concluir. Verifique sua conexão e permissões.');return false}}
+
+function setStatus(coll,id,v){
+  run(async()=>{
+    const b=FS.writeBatch(fs);
+    b.update(dref(coll,id),{status:v});
+    if(coll==='appointments'){
+      const a=db.appointments.find(x=>x.id===id);
+      if(a){if(v==='Cancelado')b.delete(dref('slots',slotId(a)));else b.set(dref('slots',slotId(a)),{date:a.date,time:a.time})}
+    }
+    await b.commit();
+  },'Status atualizado');
+}
+function del(coll,id,msg){
+  if(!confirm(msg||'Tem certeza que deseja excluir? Essa ação não pode ser desfeita.'))return;
+  run(async()=>{
+    const b=FS.writeBatch(fs);
+    b.delete(dref(coll,id));
+    if(coll==='appointments'){const a=db.appointments.find(x=>x.id===id);if(a)b.delete(dref('slots',slotId(a)))}
+    await b.commit();
+    if(coll==='gallery')await removeStoredImage((db.gallery.find(x=>x.id===id)||{}).img);
+  },'Excluído');
+}
+
+async function removeStoredImage(url){
+  if(!storage||!url||!/^https:\/\/firebasestorage|^gs:\/\//.test(url))return;
+  try{await ST.deleteObject(ST.ref(storage,url))}catch(e){console.error(e)}
+}
+function resizeImage(file,max,q){return new Promise((res,rej)=>{const fr=new FileReader();fr.onerror=rej;fr.onload=()=>{const im=new Image();im.onerror=rej;im.onload=()=>{const k=Math.min(1,max/Math.max(im.width,im.height));const c=document.createElement('canvas');c.width=Math.round(im.width*k);c.height=Math.round(im.height*k);c.getContext('2d').drawImage(im,0,0,c.width,c.height);res(c.toDataURL('image/jpeg',q))};im.src=fr.result};fr.readAsDataURL(file)})}
+async function prepareImage(file){
+  if(useStorage()){
+    const data=await resizeImage(file,1600,.85);
+    const blob=await (await fetch(data)).blob();
+    const r=ST.ref(storage,`gallery/${uid()}.jpg`);
+    await ST.uploadBytes(r,blob,{contentType:'image/jpeg'});
+    return ST.getDownloadURL(r);
+  }
+  for(const [m,q] of [[1000,.78],[800,.7],[640,.62],[520,.55]]){
+    const d=await resizeImage(file,m,q);
+    if(d.length<850000)return d;
+  }
+  throw new Error('big');
+}
+
+const R={};
+const REQ_ST=['Novo','Em análise','Orçado','Fechado','Cancelado'];
+const APP_ST=['Pendente','Confirmado','Concluído','Cancelado'];
+
+R.dashboard=()=>{
+  const b=badges();const reqs=[...db.requests].sort(byDesc('createdAt')).slice(0,5);
+  const ups=db.appointments.filter(a=>!['Cancelado','Concluído'].includes(a.status)).sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time)).slice(0,5);
+  return `
+  <div class="stats">
+    <div class="stat" onclick="nav('requests')"><span class="ico">${icon('inbox')}</span><div><b>${b.requests}</b><span>Solicitações novas</span></div></div>
+    <div class="stat" onclick="nav('appointments')"><span class="ico">${icon('cal')}</span><div><b>${b.appointments}</b><span>Agendamentos pendentes</span></div></div>
+    <div class="stat" onclick="nav('clients')"><span class="ico">${icon('users')}</span><div><b>${db.clients.length}</b><span>Clientes</span></div></div>
+    <div class="stat" onclick="nav('reviews')"><span class="ico">${icon('star')}</span><div><b>${b.reviews}</b><span>Avaliações a moderar</span></div></div>
+    <div class="stat" onclick="nav('gallery')"><span class="ico">${icon('image')}</span><div><b>${db.gallery.length}</b><span>Fotos na galeria</span></div></div>
+    <div class="stat" onclick="nav('services')"><span class="ico">${icon('wrench')}</span><div><b>${db.services.filter(s=>s.active!==false).length}</b><span>Serviços ativos</span></div></div>
+  </div>
+  <div class="two">
+    <div class="box"><h3>Últimas solicitações</h3><div class="list">${reqs.map(r=>`
+      <div class="item"><div class="info"><b>${esc(r.name)}</b><span>${esc(r.service)} • ${fmtDT(r.createdAt)}</span></div>${statusSel('requests',r.id,r.status,REQ_ST)}</div>`).join('')||'<div class="empty">Nenhuma solicitação ainda.</div>'}</div></div>
+    <div class="box"><h3>Próximos agendamentos</h3><div class="list">${ups.map(a=>{const [y,m,d]=a.date.split('-');return `
+      <div class="item"><div class="date"><b>${d}</b><span>${MONTHS[+m-1]} • ${esc(a.time)}</span></div><div class="info"><b>${esc(a.name)}</b><span>${esc(a.kind)}</span></div>${statusSel('appointments',a.id,a.status,APP_ST)}</div>`}).join('')||'<div class="empty">Nenhum agendamento futuro.</div>'}</div></div>
+  </div>`;
+};
+
+const company=()=>db.settings.company||'VSR';
+R.requests=()=>{
+  const list=[...db.requests].sort(byDesc('createdAt'));
+  const rows=list.map(r=>`<tr>
+    <td>${fmtDT(r.createdAt)}</td>
+    <td><b>${esc(r.name)}</b><small>${esc(r.phone)}${r.email?' • '+esc(r.email):''}</small><small>${esc(r.address||'')}</small></td>
+    <td>${esc(r.service)}<small>${esc(r.property)} • ${esc(r.urgency||'')}</small><div class="msg">${esc(r.message)}</div></td>
+    <td>${statusSel('requests',r.id,r.status,REQ_ST)}</td>
+    <td><div class="acts"><a class="btn wa xs" target="_blank" rel="noopener" href="${waLink(r.phone,`Olá ${r.name}! Aqui é da ${company()}. Recebemos seu pedido de orçamento (${r.service}).`)}">WhatsApp</a><button class="btn danger xs" onclick="del('requests','${r.id}')">Excluir</button></div></td></tr>`).join('');
+  return `<div class="box"><div class="toolbar"><input type="search" placeholder="Buscar solicitação..." oninput="filterRows(this.value,'tReq')"></div>
+  <div class="tbl-wrap"><table id="tReq"><thead><tr><th>Data</th><th>Cliente</th><th>Pedido</th><th>Status</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table></div>${list.length?'':'<div class="empty">Nenhuma solicitação ainda.</div>'}</div>`;
+};
+
+R.appointments=()=>{
+  action('Novo agendamento','editAppt()');
+  const list=[...db.appointments].sort((a,b)=>(b.date+b.time).localeCompare(a.date+a.time));
+  const rows=list.map(a=>`<tr>
+    <td><b>${fmtDate(a.date)}</b><small>${esc(a.time)}</small></td>
+    <td><b>${esc(a.name)}</b><small>${esc(a.phone)}</small><small>${esc(a.address||'')}</small></td>
+    <td>${esc(a.kind)}<div class="msg">${esc(a.notes||'')}</div></td>
+    <td>${statusSel('appointments',a.id,a.status,APP_ST)}</td>
+    <td><div class="acts"><a class="btn wa xs" target="_blank" rel="noopener" href="${waLink(a.phone,`Olá ${a.name}! Aqui é da ${company()}. Sobre seu agendamento de ${a.kind} em ${fmtDate(a.date)} às ${a.time}.`)}">WhatsApp</a><button class="btn ghost xs" onclick="editAppt('${a.id}')">Editar</button><button class="btn danger xs" onclick="del('appointments','${a.id}')">Excluir</button></div></td></tr>`).join('');
+  return `<div class="box"><div class="toolbar"><input type="search" placeholder="Buscar agendamento..." oninput="filterRows(this.value,'tApp')"></div>
+  <div class="tbl-wrap"><table id="tApp"><thead><tr><th>Data/Hora</th><th>Cliente</th><th>Atendimento</th><th>Status</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table></div>${list.length?'':'<div class="empty">Nenhum agendamento.</div>'}</div>`;
+};
+function editAppt(id){
+  const a=db.appointments.find(x=>x.id===id)||{};
+  const slots=['08:00','09:00','10:00','11:00','13:00','14:00','15:00','16:00','17:00'];
+  modal(id?'Editar agendamento':'Novo agendamento',
+   `<div class="grid2">${F('Nome','name',a.name,'text','required')}${F('Telefone','phone',a.phone,'tel','required')}</div>${F('Endereço','address',a.address)}
+    <div class="grid2">${S('Tipo','kind',['Revisão elétrica','Manutenção preventiva','Manutenção corretiva','Visita técnica para orçamento'],a.kind)}${S('Status','status',APP_ST,a.status||'Confirmado')}</div>
+    <div class="grid2">${F('Data','date',a.date||todayStr(),'date','required')}${S('Horário','time',slots,a.time)}</div>${T('Observações','notes',a.notes)}`,
+   async fd=>{
+     const o=Object.fromEntries(fd);
+     if(db.appointments.some(x=>x.id!==id&&x.date===o.date&&x.time===o.time&&x.status!=='Cancelado')&&o.status!=='Cancelado'){alert('Já existe um agendamento nesse dia e horário.');return false}
+     const b=FS.writeBatch(fs);
+     if(id&&(a.date!==o.date||a.time!==o.time))b.delete(dref('slots',slotId(a)));
+     if(o.status!=='Cancelado')b.set(dref('slots',slotId(o)),{date:o.date,time:o.time});
+     else if(id)b.delete(dref('slots',slotId(o)));
+     const ref=id?dref('appointments',id):FS.doc(col('appointments'));
+     b.set(ref,id?o:{createdAt:new Date().toISOString(),...o},{merge:true});
+     await b.commit();toast('Agendamento salvo');
+   });
+}
+
+R.clients=()=>{
+  action('Novo cliente','editClient()');
+  const list=[...db.clients].sort((a,b)=>String(a.name).localeCompare(String(b.name)));
+  const rows=list.map(c=>{const p=digits(c.phone);const n=db.requests.filter(r=>digits(r.phone)===p).length,m=db.appointments.filter(a=>digits(a.phone)===p).length;
+   return `<tr><td><b>${esc(c.name)}</b><small>Desde ${fmtDate(c.createdAt)}</small></td><td>${esc(c.phone)}<small>${esc(c.email||'')}</small></td><td>${esc(c.address||'')}<div class="msg">${esc(c.notes||'')}</div></td>
+   <td>${n} orç. • ${m} agend.</td>
+   <td><div class="acts"><a class="btn wa xs" target="_blank" rel="noopener" href="${waLink(c.phone,`Olá ${c.name}! Aqui é da ${company()}.`)}">WhatsApp</a><button class="btn ghost xs" onclick="editClient('${c.id}')">Editar</button><button class="btn danger xs" onclick="del('clients','${c.id}')">Excluir</button></div></td></tr>`}).join('');
+  return `<div class="box"><div class="toolbar"><input type="search" placeholder="Buscar cliente..." oninput="filterRows(this.value,'tCli')"></div>
+  <div class="tbl-wrap"><table id="tCli"><thead><tr><th>Nome</th><th>Contato</th><th>Endereço / Notas</th><th>Histórico</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table></div>${list.length?'':'<div class="empty">Nenhum cliente cadastrado.</div>'}</div>`;
+};
+function editClient(id){
+  const c=db.clients.find(x=>x.id===id)||{};
+  modal(id?'Editar cliente':'Novo cliente',
+   `${F('Nome','name',c.name,'text','required')}<div class="grid2">${F('Telefone / WhatsApp','phone',c.phone,'tel','required')}${F('E-mail','email',c.email,'email')}</div>${F('Endereço','address',c.address)}${T('Observações','notes',c.notes)}`,
+   async fd=>{
+     const o=Object.fromEntries(fd);
+     if(id)await FS.setDoc(dref('clients',id),o,{merge:true});else await FS.addDoc(col('clients'),{createdAt:todayStr(),...o});
+     toast('Cliente salvo');
+   });
+}
+
+R.services=()=>{
+  action('Novo serviço','editService()');
+  const list=[...db.services].sort((a,b)=>(a.order||0)-(b.order||0));
+  return `<div class="cards-s">${list.map(s=>`
+   <div class="sv ${s.active===false?'off':''}"><div class="top"><span class="ico">${icon(s.icon)}</span><div><b>${esc(s.title)}</b><br><span class="tag ${s.active===false?'off':''}">${s.active===false?'Oculto':'Visível no site'}</span></div></div>
+   <p>${esc(s.desc)}</p>${s.price?`<p><b>${esc(s.price)}</b></p>`:''}
+   <div class="acts"><button class="btn ghost xs" onclick="toggleService('${s.id}')">${s.active===false?'Mostrar':'Ocultar'}</button><button class="btn ghost xs" onclick="editService('${s.id}')">Editar</button><button class="btn danger xs" onclick="del('services','${s.id}')">Excluir</button></div></div>`).join('')}</div>
+   ${list.length?'':'<div class="box empty">Nenhum serviço. Clique em “Novo serviço”.</div>'}`;
+};
+function toggleService(id){const s=db.services.find(x=>x.id===id);run(()=>FS.updateDoc(dref('services',id),{active:s.active===false}))}
+function editService(id){
+  const s=db.services.find(x=>x.id===id)||{};
+  modal(id?'Editar serviço':'Novo serviço',
+   `${F('Título','title',s.title,'text','required')}${T('Descrição','desc',s.desc,'required')}
+    <div class="grid2">${F('Preço (opcional)','price',s.price,'text','placeholder="Ex.: a partir de R$ 100"')}${S('Ícone','icon',ICON_CHOICES.map(i=>[i,i]),s.icon||'bolt')}</div>
+    ${S('Visibilidade','active',[['1','Visível no site'],['0','Oculto']],s.active===false?'0':'1')}`,
+   async fd=>{
+     const o=Object.fromEntries(fd);o.active=o.active==='1';
+     if(id)await FS.setDoc(dref('services',id),o,{merge:true});else await FS.addDoc(col('services'),{...o,order:Date.now()});
+     toast('Serviço salvo');
+   });
+}
+
+R.gallery=()=>{
+  action('Adicionar foto','editPhoto()');
+  const list=[...db.gallery].sort(byDesc('createdAt'));
+  return list.length?`<div class="photos">${list.map(g=>`
+   <div class="photo"><img src="${esc(g.img)}" alt="${esc(g.title)}"><div class="pb"><b>${esc(g.title)}</b><span class="c">${esc(g.category||'Sem categoria')}</span><div style="font-size:.8rem;color:var(--muted);margin-bottom:12px">${esc(g.desc||'')}</div>
+   <div class="acts"><button class="btn ghost xs" onclick="editPhoto('${g.id}')">Editar</button><button class="btn danger xs" onclick="del('gallery','${g.id}')">Excluir</button></div></div></div>`).join('')}</div>`
+  :'<div class="box empty">Nenhuma foto ainda. Clique em “Adicionar foto”.</div>';
+};
+function previewFile(inp){const f=inp.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{$('#pv').src=r.result;$('#pv').style.display='block'};r.readAsDataURL(f)}
+function editPhoto(id){
+  const g=db.gallery.find(x=>x.id===id)||{};
+  const cats=[...new Set(['Iluminação','Fiação','Manutenção','Reformas','Predial',...db.gallery.map(x=>x.category)])].filter(Boolean);
+  modal(id?'Editar foto':'Adicionar foto',
+   `<img id="pv" class="preview" src="${esc(g.img||'')}" style="${g.img?'':'display:none'}" alt="">
+    <div class="field"><label>Imagem ${id?'(deixe vazio para manter a atual)':'*'}</label><input type="file" name="file" accept="image/*" onchange="previewFile(this)"></div>
+    ${F('…ou link da imagem (URL)','url','','url','placeholder="https://..."')}
+    ${F('Título','title',g.title,'text','required')}
+    <div class="field"><label>Categoria</label><input name="category" list="cats" value="${esc(g.category||'')}" placeholder="Escolha ou digite"><datalist id="cats">${cats.map(c=>`<option value="${esc(c)}">`).join('')}</datalist></div>
+    ${T('Descrição','desc',g.desc)}`,
+   async fd=>{
+     const file=fd.get('file'),url=(fd.get('url')||'').trim();let img=g.img||'';
+     if(file&&file.size){
+       try{img=await prepareImage(file)}catch(e){console.error(e);alert('Não foi possível enviar essa imagem. Tente uma foto menor.');return false}
+       if(id&&g.img&&g.img!==img)await removeStoredImage(g.img);
+     }else if(url&&url!==img){img=url}
+     if(!img){alert('Selecione uma imagem ou informe um link.');return false}
+     const o={title:fd.get('title'),category:(fd.get('category')||'').trim(),desc:fd.get('desc'),img};
+     if(id)await FS.setDoc(dref('gallery',id),o,{merge:true});else await FS.addDoc(col('gallery'),{...o,createdAt:new Date().toISOString()});
+     toast('Foto salva');
+   });
+}
+
+R.reviews=()=>{
+  action('Nova avaliação','editReview()');
+  const list=[...db.reviews].sort((a,b)=>(a.status==='pending'?0:1)-(b.status==='pending'?0:1)||String(b.date||'').localeCompare(String(a.date||'')));
+  const rows=list.map(r=>`<tr><td>${fmtDate(r.date)}</td><td><b>${esc(r.name)}</b><small>${esc(r.place||'')}</small></td><td>${stars(+r.rating||0)}<div class="msg">${esc(r.text)}</div></td>
+   <td>${statusSel('reviews',r.id,r.status,[['pending','Pendente'],['approved','Publicada'],['hidden','Oculta']])}</td>
+   <td><div class="acts"><button class="btn ghost xs" onclick="editReview('${r.id}')">Editar</button><button class="btn danger xs" onclick="del('reviews','${r.id}')">Excluir</button></div></td></tr>`).join('');
+  return `<div class="box"><div class="tbl-wrap"><table><thead><tr><th>Data</th><th>Cliente</th><th>Avaliação</th><th>Status</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table></div>${list.length?'':'<div class="empty">Sem avaliações.</div>'}</div>`;
+};
+function editReview(id){
+  const r=db.reviews.find(x=>x.id===id)||{};
+  modal(id?'Editar avaliação':'Nova avaliação',
+   `<div class="grid2">${F('Nome','name',r.name,'text','required')}${F('Tipo / Local','place',r.place)}</div>
+    <div class="grid2">${S('Nota','rating',[5,4,3,2,1].map(n=>[String(n),'★'.repeat(n)]),String(r.rating||5))}${S('Status','status',[['approved','Publicada'],['pending','Pendente'],['hidden','Oculta']],r.status||'approved')}</div>${T('Comentário','text',r.text,'required')}`,
+   async fd=>{
+     const o=Object.fromEntries(fd);o.rating=+o.rating;
+     if(id)await FS.setDoc(dref('reviews',id),o,{merge:true});else await FS.addDoc(col('reviews'),{date:todayStr(),...o});
+     toast('Avaliação salva');
+   });
+}
+
+R.settings=()=>{
+  const s=db.settings;
+  setTimeout(()=>{
+    const f=$('#setForm');if(!f)return;
+    f.onsubmit=async e=>{e.preventDefault();const o=Object.fromEntries(new FormData(e.target));o.whatsapp=digits(o.whatsapp);
+      if(await run(()=>FS.setDoc(dref('settings','main'),o,{merge:true}),'Configurações salvas'))drawNav()};
+    $('#exp').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(db,null,2)],{type:'application/json'}));a.download='backup.json';a.click()};
+    $('#pw').onclick=async()=>{const u=auth.currentUser;if(!u||!u.email)return;try{await AU.sendPasswordResetEmail(auth,u.email);toast('Enviamos um link de redefinição para '+u.email)}catch(e){console.error(e);toast('Não foi possível enviar o e-mail agora.')}};
+  });
+  return `<div class="two">
+   <form class="box" id="setForm"><h3>Empresa e contato</h3>
+    ${F('Nome da empresa','company',s.company||'VSR','text','required')}
+    ${F('WhatsApp (com DDD, só números)','whatsapp',s.whatsapp||'','text','placeholder="5527999999999" inputmode="numeric"')}
+    <div class="grid2">${F('Telefone exibido','phone',s.phone||'')}${F('E-mail','email',s.email||'')}</div>
+    ${F('Endereço','address',s.address||'')}${F('Horário de atendimento','hours',s.hours||'')}
+    <button class="btn">Salvar configurações</button></form>
+   <div class="box"><h3>Acesso e backup</h3><p style="color:var(--muted);font-size:.88rem;margin-bottom:16px">Altere sua senha por e-mail ou baixe uma cópia dos dados.</p>
+    <div class="acts"><button class="btn ghost" id="pw">Redefinir senha por e-mail</button><button class="btn ghost" id="exp">Exportar backup</button></div></div></div>`;
+};
+
+boot();
+</script>
+</body>
+</html>
